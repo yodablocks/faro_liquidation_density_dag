@@ -1,0 +1,12 @@
+Faro Liquidation Density — Run Summary
+Asset: BTC
+Run at: 2026-06-05T17:57:15.382626+00:00
+Source DB: /Users/zkmarc/Coding_2026/hl-liquidation-heatmap/liquidations.db
+Events captured: 2425
+Density rows: 20
+Total notional: $359.71M
+Long liquidated: $269.20M (74.8%)
+Short liquidated: $90.50M (25.2%)
+Mark price at run: $60,785
+Signal: BEARISH (confidence 84.0%)
+Summary: Liquidation cluster $133.7M below spot at $60,500-$61,000. Long-heavy: 84%. Signal: BEARISH.

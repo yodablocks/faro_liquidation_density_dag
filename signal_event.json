@@ -1,0 +1,14 @@
+{
+  "signal_type": "liquidation_cascade",
+  "asset": "BTC",
+  "trust_tier": 1,
+  "direction": "bearish",
+  "value_usd": 133677877.32,
+  "confidence": 0.84,
+  "mark_px": 60785.0,
+  "cluster_low": 60500,
+  "cluster_high": 61000,
+  "long_pct": 84.0,
+  "summary": "Liquidation cluster $133.7M below spot at $60,500-$61,000. Long-heavy: 84%. Signal: BEARISH.",
+  "timestamp": "2026-06-05T17:57:15.381757+00:00"
+}
