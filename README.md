@@ -12,6 +12,8 @@ No third-party data required. Chain-native source only.
 
 ## What it produces
 
+![Liquidation density heatmap](screenshots/liquidation_density_heatmap.png)
+
 ```
 Bucket      Long $       Short $      Total $    Long%   Dist%
 $60,500   $86,266.9K    $6,031.3K   $92,298.2K  93.5%  -0.47%  SPOT  HOT ZONE
