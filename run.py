@@ -1,6 +1,5 @@
 """
 run.py
-======
 Standalone runner for the liquidation density pipeline.
 Executes the same logic as faro_liquidation_density_dag.py
 without requiring an Airflow installation.
@@ -10,17 +9,11 @@ Usage:
 
 The liquidations.db is written by stream.py from:
     https://github.com/yodablocks/hl-liquidation-heatmap
-
-Output:
-    - liquidation_density.db  (SQLite output table)
-    - density_summary.txt     (human-readable report)
-    - signal_event.json       (agent-ready SignalEvent payload)
 """
 
 import argparse
 import json
 import math
-import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -32,21 +25,18 @@ import requests
 # ── config ────────────────────────────────────────────────────────────────────
 
 COIN = "BTC"
-BUCKET_SIZE = 500           # $500 price buckets
+BUCKET_SIZE = 500
 LOOKBACK_HOURS = 72
-MAX_STALENESS_S = 600       # 10 minutes
+MAX_STALENESS_S = 600
 MIN_CLUSTER_USD = 50_000
 PROXIMITY_PCT = 2.0
 HL_REST_URL = "https://api.hyperliquid.xyz/info"
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def bucket(price: float) -> int:
     return int(math.floor(price / BUCKET_SIZE) * BUCKET_SIZE)
-
-
-def period_label(ts_ms: int) -> str:
-    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:00")
 
 
 def mark_px() -> float:
@@ -59,45 +49,55 @@ def mark_px() -> float:
     raise ValueError(f"{COIN} not found in HL universe")
 
 
-# ── pipeline steps ────────────────────────────────────────────────────────────
+# ── pipeline ──────────────────────────────────────────────────────────────────
 
-def check_freshness(db_path: Path):
-    print(f"\n[1/6] Freshness check — {db_path}")
+def run(db_path: Path):
+    # freshness check
     if not db_path.exists():
         raise FileNotFoundError(f"DB not found: {db_path}")
-    conn = sqlite3.connect(db_path)
-    row = conn.execute(
-        "SELECT MAX(ts), COUNT(*) FROM liquidations WHERE coin=?", (COIN,)
-    ).fetchone()
-    conn.close()
-    max_ts, count = row
-    if not max_ts:
-        raise ValueError(f"No rows for {COIN} in {db_path}")
-    age = (time.time() * 1000 - max_ts) / 1000
-    print(f"    {count} events captured. Most recent: {age:.0f}s ago.")
-    if age > MAX_STALENESS_S:
-        print(f"    WARNING: data is {age:.0f}s old (threshold {MAX_STALENESS_S}s).")
-    else:
-        print(f"    Freshness OK.")
-    return count
 
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT MAX(ts) FROM liquidations WHERE coin=?", (COIN,)
+        ).fetchone()
+        max_ts = row[0]
+        if not max_ts:
+            raise ValueError(f"No rows for {COIN}")
+        age = (time.time() * 1000 - max_ts) / 1000
+        if age > MAX_STALENESS_S:
+            print(f"WARNING: data is {age:.0f}s old (threshold {MAX_STALENESS_S}s)")
 
-def build_density(db_path: Path) -> list[dict]:
-    print(f"\n[2/6] Building density table from {LOOKBACK_HOURS}h of events...")
-    cutoff_ms = int((time.time() - LOOKBACK_HOURS * 3600) * 1000)
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute(
-        "SELECT px, notional, side, ts FROM liquidations "
-        "WHERE coin=? AND ts>=? ORDER BY ts",
-        (COIN, cutoff_ms)
-    ).fetchall()
-    conn.close()
+        # fetch only the lookback window
+        cutoff_ms = int((time.time() - LOOKBACK_HOURS * 3600) * 1000)
+        rows = conn.execute(
+            "SELECT px, notional, side, ts FROM liquidations "
+            "WHERE coin=? AND ts>=? ORDER BY ts",
+            (COIN, cutoff_ms)
+        ).fetchall()
 
+    # build + validate in one pass
+    if not rows:
+        raise ValueError(f"No rows for {COIN} in the last {LOOKBACK_HOURS}h — check DB")
+
+    by_bucket: dict[int, dict] = defaultdict(lambda: {"long": 0.0, "short": 0.0})
     agg: dict[tuple, dict] = defaultdict(lambda: {"notional": 0.0, "count": 0})
-    for px, notional, side, ts in rows:
-        key = (bucket(float(px)), period_label(int(ts)), side)
-        agg[key]["notional"] += float(notional)
-        agg[key]["count"] += 1
+    long_total = short_total = 0.0
+
+    for price, notional, side, ts in rows:
+        bkt = bucket(float(price))
+        period = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:00")
+        notional = float(notional)
+        agg[(bkt, period, side)]["notional"] += notional
+        agg[(bkt, period, side)]["count"] += 1
+        by_bucket[bkt][side] += notional
+        if side == "long":
+            long_total += notional
+        else:
+            short_total += notional
+
+    total = long_total + short_total
+    if total >= 50_000_000_000:
+        raise ValueError(f"Notional ${total:.0f} exceeds sanity bound — possible data corruption")
 
     density = [
         {
@@ -111,230 +111,104 @@ def build_density(db_path: Path) -> list[dict]:
         }
         for k, v in agg.items()
     ]
-    print(f"    {len(rows)} raw events -> {len(density)} density rows "
-          f"across {len(set(r['price_bucket'] for r in density))} price buckets.")
-    return density
 
+    # write store
+    output_db = db_path.parent / "liquidation_density.db"
+    with sqlite3.connect(output_db) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS liquidation_density (
+                coin TEXT, price_bucket INTEGER, period TEXT, side TEXT,
+                notional_usd REAL DEFAULT 0, event_count INTEGER DEFAULT 0,
+                updated_at TEXT, PRIMARY KEY (coin, price_bucket, period, side)
+            )
+        """)
+        conn.executemany("""
+            INSERT INTO liquidation_density
+              (coin, price_bucket, period, side, notional_usd, event_count, updated_at)
+            VALUES (:coin, :price_bucket, :period, :side, :notional_usd, :event_count, :updated_at)
+            ON CONFLICT (coin, price_bucket, period, side) DO UPDATE SET
+              notional_usd = excluded.notional_usd,
+              event_count  = excluded.event_count,
+              updated_at   = excluded.updated_at
+        """, density)
 
-def validate(density: list[dict]):
-    print(f"\n[3/6] Validating density table...")
-    assert density, "Empty density — check DB"
-    for r in density:
-        assert r["price_bucket"] is not None
-        assert r["side"] in ("long", "short"), f"Bad side: {r['side']}"
-        assert r["notional_usd"] >= 0, "Negative notional"
-    total = sum(r["notional_usd"] for r in density)
-    long_total  = sum(r["notional_usd"] for r in density if r["side"] == "long")
-    short_total = sum(r["notional_usd"] for r in density if r["side"] == "short")
-    assert total < 50_000_000_000, f"Notional ${total:.0f} exceeds sanity bound"
-    print(f"    Total notional:  ${total/1e6:.2f}M")
-    print(f"    Long liquidated: ${long_total/1e6:.2f}M  "
-          f"({long_total/total*100:.1f}%)")
-    print(f"    Short liquidated:${short_total/1e6:.2f}M  "
-          f"({short_total/total*100:.1f}%)")
-    print(f"    Validation passed.")
-    return total, long_total, short_total
-
-
-def write_store(density: list[dict], output_db: Path):
-    print(f"\n[4/6] Writing to store -> {output_db}")
-    conn = sqlite3.connect(output_db)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS liquidation_density (
-            coin          TEXT    NOT NULL,
-            price_bucket  INTEGER NOT NULL,
-            period        TEXT    NOT NULL,
-            side          TEXT    NOT NULL,
-            notional_usd  REAL    NOT NULL DEFAULT 0,
-            event_count   INTEGER NOT NULL DEFAULT 0,
-            updated_at    TEXT,
-            PRIMARY KEY (coin, price_bucket, period, side)
-        )
-    """)
-    conn.commit()
-    conn.executemany("""
-        INSERT INTO liquidation_density
-          (coin, price_bucket, period, side, notional_usd, event_count, updated_at)
-        VALUES (:coin, :price_bucket, :period, :side, :notional_usd, :event_count, :updated_at)
-        ON CONFLICT (coin, price_bucket, period, side) DO UPDATE SET
-          notional_usd = excluded.notional_usd,
-          event_count  = excluded.event_count,
-          updated_at   = excluded.updated_at
-    """, density)
-    conn.commit()
-    conn.close()
-    print(f"    {len(density)} rows written.")
-
-
-def print_heatmap(density: list[dict], px: float):
-    print(f"\n[5/6] Density summary (current mark price: ${px:,.0f})")
-    print(f"    {'Bucket':>10}  {'Long $':>12}  {'Short $':>12}  "
-          f"{'Total $':>12}  {'Long%':>6}  {'Dist%':>7}")
-    print(f"    {'-'*65}")
-
-    by_bucket: dict[int, dict] = defaultdict(lambda: {"long": 0.0, "short": 0.0})
-    for r in density:
-        by_bucket[r["price_bucket"]][r["side"]] += r["notional_usd"]
-
-    # Sort by total notional descending, show top 15
-    ranked = sorted(
-        by_bucket.items(),
-        key=lambda x: x[1]["long"] + x[1]["short"],
-        reverse=True
-    )[:15]
-
-    for bkt, v in ranked:
-        total = v["long"] + v["short"]
-        long_pct = v["long"] / total * 100 if total else 0
-        dist_pct = (bkt - px) / px * 100
-        marker = " <-- SPOT" if abs(dist_pct) < 1.0 else ""
-        proximity = " ** HOT ZONE **" if (
-            total >= MIN_CLUSTER_USD and abs(dist_pct) <= PROXIMITY_PCT
-        ) else ""
-        print(f"    ${bkt:>9,}  ${v['long']/1e3:>10.1f}K  "
-              f"${v['short']/1e3:>10.1f}K  ${total/1e3:>10.1f}K  "
-              f"{long_pct:>5.1f}%  {dist_pct:>+6.2f}%"
-              f"{marker}{proximity}")
-
-
-def publish_signal(density: list[dict], px: float) -> dict:
-    print(f"\n[6/6] Publishing SignalEvent...")
-    by_bucket: dict[int, dict] = defaultdict(lambda: {"long": 0.0, "short": 0.0})
-    for r in density:
-        by_bucket[r["price_bucket"]][r["side"]] += r["notional_usd"]
+    # mark price + signal
+    try:
+        spot = mark_px()
+    except Exception as e:
+        if not by_bucket:
+            raise RuntimeError("No bucket data and mark price fetch failed — cannot continue") from e
+        print(f"Warning: mark price fetch failed ({e}). Using mean bucket boundary.")
+        spot = float(sum(by_bucket) / len(by_bucket))
 
     nearby = {
         bkt: v for bkt, v in by_bucket.items()
-        if abs(bkt - px) <= px * (PROXIMITY_PCT / 100)
+        if abs(bkt - spot) <= spot * (PROXIMITY_PCT / 100)
         and (v["long"] + v["short"]) >= MIN_CLUSTER_USD
     }
 
-    if not nearby:
-        print(f"    No significant cluster within {PROXIMITY_PCT}% of spot.")
-        return {}
-
-    long_usd  = sum(v["long"]  for v in nearby.values())
-    short_usd = sum(v["short"] for v in nearby.values())
-    total     = long_usd + short_usd
-    long_pct  = long_usd / total if total else 0.5
-
-    top_bkt   = max(nearby, key=lambda b: nearby[b]["long"] + nearby[b]["short"])
-    below     = top_bkt < px
-
-    if   long_pct > 0.6 and below:     direction, strength = "bearish", long_pct
-    elif long_pct < 0.4 and not below: direction, strength = "bullish", 1 - long_pct
-    else:                               direction, strength = "neutral", 0.0
+    direction, strength, top_bkt = "neutral", 0.0, None
+    if nearby:
+        long_near  = sum(v["long"]  for v in nearby.values())
+        short_near = sum(v["short"] for v in nearby.values())
+        near_total = long_near + short_near
+        long_pct   = long_near / near_total
+        top_bkt    = max(nearby, key=lambda b: nearby[b]["long"] + nearby[b]["short"])
+        below      = top_bkt < spot
+        if   long_pct > 0.6 and below:     direction, strength = "bearish", long_pct
+        elif long_pct < 0.4 and not below: direction, strength = "bullish", 1 - long_pct
+    else:
+        near_total = long_pct = 0.0
 
     event = {
-        "signal_type":  "liquidation_cascade",
-        "asset":        COIN,
-        "trust_tier":   1,
-        "direction":    direction,
-        "value_usd":    round(total, 2),
-        "confidence":   round(strength, 3),
-        "mark_px":      px,
+        "signal_type": "liquidation_cascade",
+        "asset": COIN, "trust_tier": 1,
+        "direction": direction,
+        "value_usd": round(near_total, 2),
+        "confidence": round(strength, 3),
+        "mark_px": spot,
         "cluster_low":  top_bkt,
-        "cluster_high": top_bkt + BUCKET_SIZE,
-        "long_pct":     round(long_pct * 100, 1),
+        "cluster_high": top_bkt + BUCKET_SIZE if top_bkt else None,
+        "long_pct": round(long_pct * 100, 1) if nearby else 0,
         "summary": (
-            f"Liquidation cluster ${total/1e6:.1f}M "
-            f"{'below' if below else 'above'} spot "
+            f"Liquidation cluster ${near_total/1e6:.1f}M "
+            f"{'below' if top_bkt and top_bkt < spot else 'above'} spot "
             f"at ${top_bkt:,}-${top_bkt + BUCKET_SIZE:,}. "
-            f"Long-heavy: {long_pct:.0%}. "
-            f"Signal: {direction.upper()}."
-        ),
+            f"Long-heavy: {long_pct:.0%}. Signal: {direction.upper()}."
+        ) if top_bkt else "No cluster within proximity threshold.",
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
     }
 
-    print(f"    Direction:  {direction.upper()}")
-    print(f"    Confidence: {strength:.1%}")
-    print(f"    Cluster:    ${top_bkt:,}-${top_bkt + BUCKET_SIZE:,} "
-          f"({'below' if below else 'above'} spot)")
-    print(f"    Notional:   ${total/1e6:.2f}M  (long {long_pct:.0%} / "
-          f"short {1-long_pct:.0%})")
-    print(f"    Summary:    {event['summary']}")
-    return event
+    # print summary — window count, not lifetime total
+    print(f"\n{'='*60}")
+    print(f"  Faro — Liquidation Density Pipeline")
+    print(f"  {len(rows)} events (last {LOOKBACK_HOURS}h) · ${total/1e6:.2f}M notional · mark ${spot:,.0f}")
+    print(f"{'='*60}")
+    print(f"  Long:   ${long_total/1e6:.2f}M ({long_total/total*100:.1f}%)")
+    print(f"  Short:  ${short_total/1e6:.2f}M ({short_total/total*100:.1f}%)")
+    print(f"  Signal: {direction.upper()} · confidence {strength:.0%}")
+    print(f"  {event['summary']}")
+    print(f"{'='*60}\n")
+
+    # write outputs
+    signal_f  = db_path.parent / "signal_event.json"
+    summary_f = db_path.parent / "density_summary.txt"
+    signal_f.write_text(json.dumps(event, indent=2))
+    summary_f.write_text("\n".join([
+        "Faro Liquidation Density — Run Summary",
+        f"Asset: {COIN}",
+        f"Run at: {datetime.now(tz=timezone.utc).isoformat()}",
+        f"Events (last {LOOKBACK_HOURS}h): {len(rows)}  |  Density rows: {len(density)}",
+        f"Total: ${total/1e6:.2f}M  |  Long: ${long_total/1e6:.2f}M ({long_total/total*100:.1f}%)  |  Short: ${short_total/1e6:.2f}M",
+        f"Mark price: ${spot:,.0f}",
+        f"Signal: {direction.upper()} (confidence {strength:.1%})",
+        f"Summary: {event['summary']}",
+    ]))
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Faro liquidation density pipeline — standalone runner"
-    )
-    parser.add_argument(
-        "--db",
-        default="liquidations.db",
-        help="Path to liquidations.db written by stream.py (default: liquidations.db)"
-    )
-    args = parser.parse_args()
-
-    db_path    = Path(args.db)
-    output_db  = db_path.parent / "liquidation_density.db"
-    summary_f  = db_path.parent / "density_summary.txt"
-    signal_f   = db_path.parent / "signal_event.json"
-
-    print("=" * 60)
-    print("  Faro — Liquidation Density Pipeline")
-    print(f"  Asset: {COIN}  |  Bucket: ${BUCKET_SIZE}  |  "
-          f"Lookback: {LOOKBACK_HOURS}h")
-    print("=" * 60)
-
-    # Step 1: freshness
-    count = check_freshness(db_path)
-
-    # Step 2: build
-    density = build_density(db_path)
-
-    # Step 3: validate
-    total, long_total, short_total = validate(density)
-
-    # Step 4: write store
-    write_store(density, output_db)
-
-    # Step 5: fetch mark price and print heatmap
-    print(f"\n    Fetching current mark price from Hyperliquid...")
-    try:
-        px = mark_px()
-    except Exception as e:
-        print(f"    Warning: could not fetch mark price ({e}). Using midpoint estimate.")
-        all_buckets = [r["price_bucket"] for r in density]
-        px = float(sum(all_buckets) / len(all_buckets))
-
-    print_heatmap(density, px)
-
-    # Step 6: signal event
-    event = publish_signal(density, px)
-
-    # Write outputs
-    with open(signal_f, "w") as f:
-        json.dump(event, f, indent=2)
-
-    summary_lines = [
-        "Faro Liquidation Density — Run Summary",
-        f"Asset: {COIN}",
-        f"Run at: {datetime.now(tz=timezone.utc).isoformat()}",
-        f"Source DB: {db_path}",
-        f"Events captured: {count}",
-        f"Density rows: {len(density)}",
-        f"Total notional: ${total/1e6:.2f}M",
-        f"Long liquidated: ${long_total/1e6:.2f}M ({long_total/total*100:.1f}%)",
-        f"Short liquidated: ${short_total/1e6:.2f}M ({short_total/total*100:.1f}%)",
-        f"Mark price at run: ${px:,.0f}",
-        f"Signal: {event.get('direction', 'n/a').upper()} "
-        f"(confidence {event.get('confidence', 0):.1%})",
-        f"Summary: {event.get('summary', 'No cluster within proximity threshold')}",
-    ]
-    with open(summary_f, "w") as f:
-        f.write("\n".join(summary_lines))
-
-    print(f"\n{'=' * 60}")
-    print(f"  Output files:")
-    print(f"    {output_db}")
-    print(f"    {signal_f}")
-    print(f"    {summary_f}")
-    print(f"{'=' * 60}\n")
-
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Faro liquidation density — standalone runner")
+    parser.add_argument("--db", default="liquidations.db")
+    run(Path(parser.parse_args().db))
